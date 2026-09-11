@@ -16,7 +16,6 @@ import numpy as np
 
 from tvboptim.experimental.network_dynamics.solvers import BoundedSolver, Heun
 from tvboptim.observations.observation import fc_corr, rmse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tvboptim.utils import cache
 
 from config import Config
@@ -34,9 +33,14 @@ from pipeline_contracts import (
     advance_internal_state,
     build_bundle_from_legacy_state,
     capture_internal_state,
+    eval_fc_multiseed,
     extract_bold_window,
     sync_network_delay_history,
     update_bold_history,
+    weighted_corr_loss,
+    weighted_rmse_loss,
+    compute_block_corrs,
+    plot_block_corr_bars,
 )
 
 
@@ -63,9 +67,10 @@ def run_eib(
         f"_etaF{str(cfg.eib_internal_fic_learning_rate).replace('.', 'p')}"
         f"_etaE{str(cfg.eib_max_weight_learning_rate).replace('.', 'p')}"
         f"_steps{cfg.eib_max_iterations}"
-        f"_topk{cfg.eib_posthoc_top_k}"
+        f"_phk{getattr(cfg, 'eib_posthoc_top_k', 8)}"
         f"_frozen{int(bundle_fic.params.c_ei_frozen)}"
         f"_fp{bundle_fic.fingerprint()}"
+        + (f"_seed{int(getattr(cfg, 'fc_eval_n_seeds', 1))}" if int(getattr(cfg, 'fc_eval_n_seeds', 1)) > 1 else "")
     )
 
     @cache(cache_name, redo=False)
@@ -107,6 +112,9 @@ def _run_eib_loop_pure(
     fc_target = jnp.asarray(data["fc_target"])
     n_nodes = data["n_nodes"]
     sc_mask = np.asarray(data["sc_mask"], dtype=np.float32)
+    # subcortex-가중 edge 행렬: update 방향 + snapshot 선택에 사용.
+    # block weight 모두 1.0이면 (1-eye)와 동일 → 기존 동작 그대로.
+    fc_edge_weight = jnp.asarray(data["fc_edge_weight"])
     w_max = cfg.connectivity_weight_max
 
     bold_rolling_buffer = jnp.asarray(
@@ -119,7 +127,7 @@ def _run_eib_loop_pure(
     fc_correlation_history = []
     fc_rmse_history = []
 
-    snapshot_bundle_dicts = []
+    snapshot_param_dicts = []
     snapshot_iterations = []
     snapshot_window_corrs = []
 
@@ -157,16 +165,16 @@ def _run_eib_loop_pure(
 
     for step_index in range(cfg.eib_max_iterations):
         step_result = update_model(tuned_state)
-        raw_arr = np.asarray(step_result.data)
 
-        if not np.all(np.isfinite(raw_arr)):
+        # device-side 스칼라 reduction → 전체 배열을 host로 끌어오지 않고 1 bool만 동기화
+        if not bool(jnp.all(jnp.isfinite(step_result.data))):
             print(f"[WARN] Non-finite state at step {step_index + 1}. Stopping.")
             break
 
         bold_output = tuned_bold_monitor(step_result)
         bold_vector = bold_output.ys[0, 0, :]
 
-        if not np.all(np.isfinite(np.asarray(bold_vector))):
+        if not bool(jnp.all(jnp.isfinite(bold_vector))):
             print(f"[WARN] Non-finite BOLD at step {step_index + 1}. Stopping.")
             break
 
@@ -180,23 +188,26 @@ def _run_eib_loop_pure(
         internal_state, metadata = advance_internal_state(tuned_state, metadata)
 
         if not bundle_in.params.c_ei_frozen:
-            mean_excitatory_rate, mean_inhibitory_rate = _extract_firing_rates(
-                step_result, rE_max, rI_max
-            )
+            # EI_Tuning FIC 규칙 (S_e gating per-node)
+            mean_se_node = jnp.mean(step_result.data[:, 0, :], axis=0)
+            mean_si_node = jnp.mean(step_result.data[:, 1, :], axis=0)
             fic_delta = (
                 cfg.eib_internal_fic_learning_rate
-                * mean_inhibitory_rate
-                * (mean_excitatory_rate - cfg.fic_target_firing_rate_hz)
+                * mean_si_node
+                * (mean_se_node - cfg.fic_target_se)
             )
             tuned_state.dynamics.c_ei = jnp.clip(
                 tuned_state.dynamics.c_ei + fic_delta, 0.0, 20.0
             )
 
         window_fc = _compute_fc_from_buffer(bold_rolling_buffer)
-        if not (
-            np.all(np.isfinite(np.asarray(window_fc)))
-            and np.nanstd(np.asarray(window_fc)) > 1e-8
-        ):
+        # finite & std>1e-8 판정을 device에서 끝내고 1 bool만 동기화
+        # (finite한 경우 nanstd == std이므로 nan_to_num std와 동치)
+        window_fc_ok = bool(
+            jnp.all(jnp.isfinite(window_fc))
+            & (jnp.std(jnp.nan_to_num(window_fc)) > 1e-8)
+        )
+        if not window_fc_ok:
             continue
 
         if pre_window_fc is None:
@@ -213,6 +224,7 @@ def _run_eib_loop_pure(
             eta_eib=current_eta,
             sc_mask=sc_mask,
             w_max=w_max,
+            edge_weight=fc_edge_weight,
         )
 
         c_ei_clean = jnp.clip(
@@ -228,36 +240,53 @@ def _run_eib_loop_pure(
         fc_correlation_history.append(win_corr)
         fc_rmse_history.append(win_rmse)
 
-        current_params = ParamSet(
-            c_ei=np.asarray(tuned_state.dynamics.c_ei, dtype=np.float32),
-            wLRE=np.asarray(tuned_state.coupling.coupling.wLRE, dtype=np.float32),
-            wFFI=np.asarray(tuned_state.coupling.coupling.wFFI, dtype=np.float32),
-            c_ei_frozen=bundle_in.params.c_ei_frozen,
-        ).sanitize(data["sc_mask"], cfg.connectivity_weight_max)
+        # subcortex-가중 선택 지표(win_score + snapshot argmax). block weight가
+        # 1.0이면 비가중과 사실상 동일(대각 제외 차이만) → 기존 선택과 일치.
+        win_corr_sel = float(1.0 - weighted_corr_loss(window_fc, fc_target, fc_edge_weight))
+        win_rmse_sel = float(weighted_rmse_loss(window_fc, fc_target, fc_edge_weight))
 
-        current_bundle = bundle_in.advance(
-            new_params=current_params,
-            new_init_dynamics=np.asarray(tuned_state.initial_state.dynamics, dtype=np.float32),
-            new_bold_history=np.asarray(tuned_bold_monitor.history, dtype=np.float32),
-            new_bold_window=np.asarray(bold_rolling_buffer[:, 0, :], dtype=np.float32),
-            new_internal_state=internal_state,
-            new_delay_history=bundle_in.delay_history,
-            next_stage="eib_search",
-            metadata_update=metadata,
-        )
-
-        full_term = cfg.correlation_loss_weight * (1 - win_corr) + cfg.rmse_loss_weight * win_rmse
+        full_term = cfg.correlation_loss_weight * (1 - win_corr_sel) + cfg.rmse_loss_weight * win_rmse_sel
         win_score = -(cfg.full_brain_fc_loss_weight * full_term)
 
-        if np.isfinite(win_score) and win_score > best_window_score:
+        # current_bundle은 new-best이거나 snapshot step일 때만 실제로 소비된다.
+        # 둘 다 아니면 빌드를 건너뛰어 c_ei/wLRE/wFFI/init_dynamics/bold_history(매 step
+        # 증가)/bold_window의 매 iteration host 전송을 제거한다.
+        is_new_best = np.isfinite(win_score) and win_score > best_window_score
+        is_snapshot_step = (step_index + 1) % cfg.eib_snapshot_save_interval == 0
+
+        if is_new_best or is_snapshot_step:
+            current_params = ParamSet(
+                c_ei=np.asarray(tuned_state.dynamics.c_ei, dtype=np.float32),
+                wLRE=np.asarray(tuned_state.coupling.coupling.wLRE, dtype=np.float32),
+                wFFI=np.asarray(tuned_state.coupling.coupling.wFFI, dtype=np.float32),
+                c_ei_frozen=bundle_in.params.c_ei_frozen,
+            ).sanitize(data["sc_mask"], cfg.connectivity_weight_max)
+
+            current_bundle = bundle_in.advance(
+                new_params=current_params,
+                new_init_dynamics=np.asarray(tuned_state.initial_state.dynamics, dtype=np.float32),
+                new_bold_history=np.asarray(tuned_bold_monitor.history, dtype=np.float32),
+                new_bold_window=np.asarray(bold_rolling_buffer[:, 0, :], dtype=np.float32),
+                new_internal_state=internal_state,
+                new_delay_history=bundle_in.delay_history,
+                next_stage="eib_search",
+                metadata_update=metadata,
+            )
+
+        if is_new_best:
             best_window_score = win_score
             window_best_bundle = current_bundle
             window_best_corr = win_corr
 
-        if (step_index + 1) % cfg.eib_snapshot_save_interval == 0:
-            snapshot_bundle_dicts.append(current_bundle.to_dict())
+        if is_snapshot_step:
+            # post-hoc은 snapshot에서 params만 소비한다(아래 _run_posthoc_validation
+            # 참고). delay_history(1.16GB)/bold_history 등 무거운 state는 전부
+            # warmup_bundle에서 가져오므로 snapshot엔 경량 ParamSet만 저장한다.
+            snapshot_param_dicts.append(current_params.to_numpy_dict())
             snapshot_iterations.append(step_index + 1)
-            snapshot_window_corrs.append(win_corr)
+            # post-hoc은 argmax(snapshot_window_corrs)로 best를 고른다.
+            # subcortex-가중 선택을 위해 win_corr_sel 저장(weight 1.0이면 full corr).
+            snapshot_window_corrs.append(win_corr_sel)
 
             elapsed = time.time() - start_time
             avg = elapsed / (step_index + 1)
@@ -275,7 +304,7 @@ def _run_eib_loop_pure(
 
     best_bundle, posthoc_fc, posthoc_neural, best_iteration = _run_posthoc_validation(
         network=network,
-        snapshot_bundle_dicts=snapshot_bundle_dicts,
+        snapshot_param_dicts=snapshot_param_dicts,
         snapshot_iterations=snapshot_iterations,
         snapshot_window_corrs=snapshot_window_corrs,
         fc_target=np.asarray(fc_target, dtype=np.float32),
@@ -288,6 +317,15 @@ def _run_eib_loop_pure(
     post_eib_corr = float(posthoc_fc_corr(posthoc_fc, data["fc_target"]))
     post_eib_rmse = float(np.sqrt(np.mean((np.asarray(posthoc_fc, dtype=np.float32) - np.asarray(data["fc_target"], dtype=np.float32)) ** 2)))
 
+    # Stage handoff: stamp post-hoc FC into the bundle so Part 3 reads it as
+    # pre-opt FC (exact continuity), mirroring Part 1's post_fic_fc_matrix.
+    best_bundle = best_bundle.with_metadata({
+        "post_eib_fc_matrix": np.asarray(posthoc_fc, dtype=np.float32),
+        "post_eib_fc_corr": float(post_eib_corr),
+        "post_eib_fc_rmse": float(post_eib_rmse),
+    })
+
+    _ns_eib = max(1, int(getattr(cfg, "neural_cache_stride", 1)))   # cache 경량화(plot 전용 trace)
     return {
         "bundle": best_bundle.to_dict(),
         "fc_correlations": np.asarray(fc_correlation_history or [np.nan], dtype=np.float32),
@@ -301,14 +339,14 @@ def _run_eib_loop_pure(
         "best_iteration": int(best_iteration),
         "best_fc_corr": float(post_eib_corr),
         "best_fc_rmse": float(post_eib_rmse),
-        "pre_eib_neural": np.asarray(raw_result_pre_eib.data, dtype=np.float32),
-        "post_eib_neural": posthoc_neural,
+        "pre_eib_neural": np.asarray(raw_result_pre_eib.data, dtype=np.float32)[::_ns_eib],
+        "post_eib_neural": np.asarray(posthoc_neural, dtype=np.float32)[::_ns_eib],
     }
 
 
 def _run_posthoc_validation(
     network,
-    snapshot_bundle_dicts: list,
+    snapshot_param_dicts: list,
     snapshot_iterations: list,
     snapshot_window_corrs: list,
     fc_target: np.ndarray,
@@ -317,7 +355,7 @@ def _run_posthoc_validation(
     fallback_bundle: StateBundle,
     warmup_bundle: StateBundle = None,  # Patch 25: step-0 warmup state
 ):
-    if len(snapshot_bundle_dicts) == 0:
+    if len(snapshot_param_dicts) == 0:
         print("[EIB] 2단계: 스냅샷 없음 → window best settle 사용")
         fallback_eval = _evaluate_candidate_bundle(
             network, fallback_bundle, cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr, cfg, data
@@ -329,114 +367,64 @@ def _run_posthoc_validation(
             0,
         )
 
-    top_k = min(cfg.eib_posthoc_top_k, len(snapshot_bundle_dicts))
-    top_idx = np.argsort(np.asarray(snapshot_window_corrs))[::-1][:top_k]
+    # 다수 후보 posthoc: 수렴영역(window corr 높은 구간)에서 스냅샷을 균등 K개 뽑아
+    # 각각 fresh 재시뮬 → TRUE corr 최고를 선택. patch30 단일 argmax-window 는 window 에
+    # 과적합한 스냅샷(true corr 낮음)을 고를 수 있어(예: 100012 win 0.77 vs true 0.25) 완화.
+    # snapshot 은 ParamSet 만 보관 → 전체 state 는 항상 warmup_bundle(step 0)에서 가져온다.
+    if warmup_bundle is None:
+        raise RuntimeError(
+            "EIB post-hoc requires warmup_bundle: snapshots now carry params only"
+        )
 
-    # === Patch 3: optional parallel post-hoc validation (toggle) ===
-    if getattr(cfg, 'posthoc_parallel', False):
-        print(
-            f"\n[EIB] 2단계 Post-hoc Validation (PARALLEL path): "
-            f"상위 {top_k}개 × {cfg.eib_posthoc_duration_ms//1000}분 시뮬"
-        )
-        best_eval_p, best_iter_p = _run_posthoc_validation_parallel(
-            network=network,
-            snapshot_bundle_dicts=snapshot_bundle_dicts,
-            snapshot_iterations=snapshot_iterations,
-            snapshot_window_corrs=snapshot_window_corrs,
-            top_idx=top_idx,
-            fc_target=fc_target,
-            cfg=cfg,
-            data=data,
-        )
-        if best_eval_p is None:
-            print("[EIB] parallel path: 후보 실패 → window best settle 사용")
-            fallback_eval = _evaluate_candidate_bundle(
-                network, fallback_bundle, cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr, cfg, data
-            )
-            return (fallback_eval["bundle"], fallback_eval["fc_matrix"],
-                    fallback_eval["neural_data"], 0)
-        print(
-            f"[EIB] (parallel) Final best @ iter {best_iter_p}"
-            f"  true_corr={posthoc_fc_corr(best_eval_p['fc_matrix'], fc_target):.4f}"
-        )
-        return (best_eval_p["bundle"], best_eval_p["fc_matrix"],
-                best_eval_p["neural_data"], best_iter_p)
+    wc = np.asarray(snapshot_window_corrs, dtype=np.float64)
+    finite = np.isfinite(wc)
+    wmax = float(np.nanmax(wc[finite])) if finite.any() else 0.0
+    thr = max(0.3, 0.5 * wmax)                     # LR-ramp jump 이후 수렴영역만 후보
+    conv = np.where(finite & (wc >= thr))[0]
+    if conv.size == 0:
+        conv = np.array([int(np.nanargmax(np.where(finite, wc, -np.inf)))])
+    K = max(1, min(int(getattr(cfg, "eib_posthoc_top_k", 8)), conv.size))
+    cand_idx = sorted(np.unique(conv[np.linspace(0, conv.size - 1, K).astype(int)]).tolist())
 
     print(
-        f"\n[EIB] 2단계 Post-hoc Validation: "
-        f"상위 {top_k}개 × {cfg.eib_posthoc_duration_ms//1000}분 시뮬"
+        f"\n[EIB] 2단계 Post-hoc Validation: 후보 {len(cand_idx)}개 스냅샷 "
+        f"× {cfg.eib_posthoc_duration_ms//1000}s 재시뮬 → true corr 최고 선택"
     )
-    print(f"  {'Rank':>5} {'Iter':>6} {'Win-corr':>10} {'True-corr':>10} {'True-RMSE':>10}")
-    print("  " + "-" * 46)
+    print(f"  {'Iter':>6} {'Win-corr':>10} {'True-corr':>10} {'True-RMSE':>10}")
+    print("  " + "-" * 42)
 
-    best_score = -np.inf
-    best_eval = None
-    best_iteration = 0
     start_time = time.time()
-
-    # === Patch 4 Fix 1: parallel post-hoc validation ===
-    def _eval_one(args):
-        _rank, _snap_idx = args
-        # Patch 25: post-hoc from warmup state (step 0) + snapshot params.
-        # Same principle as eval_fc() in the original EI_Tuning notebook.
-        _snap_bundle = StateBundle.from_dict(snapshot_bundle_dicts[_snap_idx])
-        if warmup_bundle is not None:
-            _cb = warmup_bundle.advance(
-                new_params=_snap_bundle.params,
-                new_init_dynamics=warmup_bundle.init_dynamics,
-                new_bold_history=warmup_bundle.bold_history,
-                new_bold_window=warmup_bundle.bold_window,
-                new_internal_state=warmup_bundle.internal_state,
-                new_delay_history=warmup_bundle.delay_history,
-                next_stage="posthoc_warmup",
-                metadata_update={},
-            )
-        else:
-            _cb = _snap_bundle
-        return _rank, _snap_idx, _evaluate_candidate_bundle(
-            network, _cb,
+    best = None  # (true_corr, eval_dict, iteration, win_corr)
+    for si in cand_idx:
+        _snap_params = ParamSet.from_numpy_dict(snapshot_param_dicts[si])
+        candidate_bundle = warmup_bundle.advance(
+            new_params=_snap_params,
+            new_init_dynamics=warmup_bundle.init_dynamics,
+            new_bold_history=warmup_bundle.bold_history,
+            new_bold_window=warmup_bundle.bold_window,
+            new_internal_state=warmup_bundle.internal_state,
+            new_delay_history=warmup_bundle.delay_history,
+            next_stage="posthoc_warmup",
+            metadata_update={},
+        )
+        ev = _evaluate_candidate_bundle(
+            network, candidate_bundle,
             cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr,
             cfg, data,
         )
-
-    n_workers = min(top_k, 4)
-    print(f"  [parallel] {top_k}개 후보를 {n_workers} workers로 동시 실행 중...")
-    _parallel_results = {}
-    with ThreadPoolExecutor(max_workers=n_workers) as _executor:
-        _futures = {
-            _executor.submit(_eval_one, (rank, snap_idx)): rank
-            for rank, snap_idx in enumerate(top_idx)
-        }
-        for _future in as_completed(_futures):
-            _rank, _snap_idx, _candidate_eval = _future.result()
-            _parallel_results[_rank] = (_snap_idx, _candidate_eval)
-
-    for rank in sorted(_parallel_results):
-        snap_idx, candidate_eval = _parallel_results[rank]
-        true_fc = candidate_eval["fc_matrix"]
-
-        true_full_corr = float(fc_corr(jnp.asarray(true_fc), jnp.asarray(fc_target)))
-        true_full_rmse = float(jnp.sqrt(jnp.mean((true_fc - fc_target) ** 2)))
-        full_term = cfg.correlation_loss_weight * (1 - true_full_corr) + cfg.rmse_loss_weight * true_full_rmse
-        true_score = -(cfg.full_brain_fc_loss_weight * full_term)
-
-        print(
-            f"  {rank+1:>5} {snapshot_iterations[snap_idx]:>6}"
-            f"  {snapshot_window_corrs[snap_idx]:>10.4f}"
-            f"  {true_full_corr:>10.4f}"
-            f"  {true_full_rmse:>10.4f}"
-        )
-
-        if np.isfinite(true_score) and true_score > best_score:
-            best_score = true_score
-            best_eval = candidate_eval
-            best_iteration = int(snapshot_iterations[snap_idx])
+        t_fc = ev["fc_matrix"]
+        t_corr = float(fc_corr(jnp.asarray(t_fc), jnp.asarray(fc_target)))
+        t_rmse = float(jnp.sqrt(jnp.mean((t_fc - fc_target) ** 2)))
+        it = int(snapshot_iterations[si])
+        print(f"  {it:>6}  {wc[si]:>10.4f}  {t_corr:>10.4f}  {t_rmse:>10.4f}")
+        if np.isfinite(t_corr) and (best is None or t_corr > best[0]):
+            best = (t_corr, ev, it, float(wc[si]))
 
     elapsed = time.time() - start_time
-    print(f"\n[EIB] 2단계 완료 — {_fmt_time(elapsed)}")
+    print(f"\n[EIB] 2단계 완료 — {_fmt_time(elapsed)}  ({len(cand_idx)} 후보 재시뮬)")
 
-    if best_eval is None:
-        print("[EIB] 모든 후보가 실패 → window best settle 사용")
+    if best is None:
+        print("[EIB] 모든 후보 non-finite → window best settle 사용")
         fallback_eval = _evaluate_candidate_bundle(
             network, fallback_bundle, cfg.eib_posthoc_duration_ms, cfg.eib_posthoc_skip_tr, cfg, data
         )
@@ -447,9 +435,14 @@ def _run_posthoc_validation(
             0,
         )
 
+    best_true_corr, best_eval, best_iteration, best_win = best
+    _bc = compute_block_corrs(
+        best_eval["fc_matrix"], fc_target, data["cortex_indices"], data["subcortex_indices"]
+    )
     print(
-        f"[EIB] Final best @ iter {best_iteration}"
-        f"  true_corr={posthoc_fc_corr(best_eval['fc_matrix'], fc_target):.4f}"
+        f"[EIB] Final best @ iter {best_iteration}  win-corr={best_win:.4f}  "
+        f"true_corr={best_true_corr:.4f}  "
+        f"(block ctx={_bc['ctx']:.3f} cross={_bc['cross']:.3f} sub={_bc['sub']:.3f})"
     )
     return (
         best_eval["bundle"],
@@ -476,10 +469,11 @@ def _evaluate_candidate_bundle(
     )
     bold_monitor = candidate_bundle.build_bold_monitor(cfg)
 
-    sim_result = sim_model(sim_state)
+    fc_matrix, sim_result = eval_fc_multiseed(
+        sim_model, sim_state, bold_monitor, _compute_fc_from_bold_output, skip_tr,
+        int(cfg.bundle_rng_seed), int(getattr(cfg, "fc_eval_n_seeds", 1)))
     bold_output = bold_monitor(sim_result)
 
-    fc_matrix = _compute_fc_from_bold_output(bold_output, skip_tr)
     sim_state.initial_state.dynamics = sim_result.data[-1]
     bold_monitor = update_bold_history(bold_monitor, sim_result)
     internal_state, metadata = advance_internal_state(sim_state, candidate_bundle.metadata)
@@ -572,8 +566,13 @@ def _eib_update_rule(
     eta_eib,
     sc_mask: np.ndarray,
     w_max: float,
+    edge_weight=None,
 ):
     fc_diff = jnp.where(jnp.isfinite(fc_target - fc_pred), fc_target - fc_pred, 0.0)
+    # subcortex-가중: subcortex가 끼는 edge의 fc_diff를 키워 update step을 늘린다.
+    # edge_weight=None 또는 전부 1.0이면 기존과 동일.
+    if edge_weight is not None:
+        fc_diff = fc_diff * edge_weight
     row_rmse = rmse(fc_target, fc_pred, axis=1)[:, None]
     row_rmse = jnp.where(jnp.isfinite(row_rmse), row_rmse, 0.0)
     wLRE_new = _clip_sym(wLRE + eta_eib * fc_diff * row_rmse, sc_mask, w_max)
@@ -583,7 +582,7 @@ def _eib_update_rule(
 
 def _clip_sym(w, sc_mask: np.ndarray, w_max: float):
     w = jnp.where(jnp.isfinite(w), w, 0.0)
-    w = jnp.clip(w, 0.0, None) * jnp.asarray(sc_mask)  # Patch: 상한 제거
+    w = jnp.clip(w, 0.0, w_max) * jnp.asarray(sc_mask)  # restore w_max cap (revert patch19)
     return 0.5 * (w + w.T)
 
 
@@ -604,40 +603,6 @@ def _fmt_time(secs: float) -> str:
 
 
 # === Patch 3: parallel post-hoc validation helper ===
-def _run_posthoc_validation_parallel(
-    network,
-    snapshot_bundle_dicts,
-    snapshot_iterations,
-    snapshot_window_corrs,
-    top_idx,
-    fc_target,
-    cfg,
-    data,
-):
-    """
-    JIT cache 재사용 + Python overhead 최소화로 sequential 대비 ~20-30% 단축.
-    진정한 device-batched vmap은 model.py 재설계가 필요하므로 별도 patch로 분리.
-    결과는 sequential 경로와 numerical하게 동등 (호출 순서/타이밍만 다름).
-    """
-    import time as _t
-    fc_target_j = jnp.asarray(fc_target)
-    fc_target_np = np.asarray(fc_target, dtype=np.float32)
-
-    print(f"  {'Rank':>5} {'Iter':>6} {'Win-corr':>10} {'True-corr':>10} {'True-RMSE':>10}")
-    print("  " + "-" * 46)
-
-    best_score = -np.inf
-    best_eval = None
-    best_iteration = 0
-    t0 = _t.time()
-
-    # 1차: 모든 candidate에 대해 시뮬을 연속 호출. JIT cache는 첫 호출 이후 재사용된다.
-    candidate_evals = []
-
-    print(f"\n[EIB] 2단계 (parallel path) 완료 — {_fmt_time(_t.time() - t0)}")
-    return best_eval, best_iteration
-
-
 def posthoc_fc_corr(fc_matrix: np.ndarray, fc_target: np.ndarray) -> float:
     return float(fc_corr(jnp.asarray(fc_matrix), jnp.asarray(fc_target)))
 
@@ -705,6 +670,20 @@ def _plot_eib_results(result: dict, data: dict, cfg: Config) -> None:
 
     plt.tight_layout()
     plt.show()
+
+    # 블록별 FC corr (full / ctx-ctx / cross / sub-sub) — subcortex fitting 진단
+    fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+    pre_b, post_b = plot_block_corr_bars(
+        ax, result["pre_eib_fc"], result["post_eib_fc"], fc_target,
+        data["cortex_indices"], data["subcortex_indices"],
+        title="Part 2 — Block-wise FC corr (pre vs post-EIB)",
+    )
+    plt.tight_layout()
+    plt.show()
+    print(
+        f"[EIB] Block corr post  full={post_b['full']:.4f}  ctx-ctx={post_b['ctx']:.4f}  "
+        f"cross={post_b['cross']:.4f}  sub-sub={post_b['sub']:.4f}"
+    )
 
 
 # ── Beta oscillation check ────────────────────────────────────

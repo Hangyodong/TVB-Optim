@@ -25,6 +25,8 @@ from tvboptim.experimental.network_dynamics import prepare
 from tvboptim.experimental.network_dynamics.solvers import BoundedSolver, Heun
 
 from config import Config
+from dbs_std import build_std_drive
+from model import _rww_H
 from pipeline_contracts import StateBundle, build_bundle_from_legacy_state
 
 
@@ -54,8 +56,6 @@ def run_dbs_stimulation(
     solver_dbs = BoundedSolver(Heun(), low=0.0, high=1.0)
     original_dynamics = network.dynamics.dynamics
 
-    stimulus_modes = ("true_p_t",)
-
     if getattr(cfg, 'dbs_parallel_targets', False):
         print(
             "[DBS] cfg.dbs_parallel_targets=True 감지: "
@@ -68,20 +68,38 @@ def run_dbs_stimulation(
     _stim_steps = derived["n_pulses"] * derived["period_steps"]
     _total_steps = _pre_steps + _stim_steps
 
-    # 모든 target의 stim 배열을 미리 생성 (Python 루프, 빠름)
-    _all_stim_arrays = {}
-    for _tl, _ti in _target_items:
-        _arr, _ = _build_biphasic_pulse_train(
-            target_node_index=_ti,
-            n_nodes=n_nodes,
-            onset_step=_pre_steps,
-            amplitude=cfg.dbs_pulse_amplitude,
-            phase_duration_steps=derived["phase_duration_steps"],
-            n_pulses=derived["n_pulses"],
-            total_steps=_total_steps,
-            gap_steps=derived["gap_steps"],
-        )
-        _all_stim_arrays[_tl] = _arr
+    if getattr(cfg, "dbs_modelb_enable", False):
+        # ── Model B: 공간(w=VTA spillover) × 시간(TM q) 선계산 (§23 iteration 구조) ──
+        from dbs_tm import tm_q_trace
+        from vta import modelb_weights
+        stimulus_modes = ("model_b",)
+        dt = cfg.integration_dt_ms
+        f_hz = derived["freq_actual_hz"]
+        qe = tm_q_trace(_total_steps, _pre_steps, derived["period_steps"], derived["n_pulses"],
+                        dt, cfg.dbs_tm_U_e, cfg.dbs_tm_tau_rec_e_ms, cfg.dbs_tm_tau_fac_e_ms)
+        qi = tm_q_trace(_total_steps, _pre_steps, derived["period_steps"], derived["n_pulses"],
+                        dt, cfg.dbs_tm_U_i, cfg.dbs_tm_tau_rec_i_ms, cfg.dbs_tm_tau_fac_i_ms)
+        rate_e = (f_hz * qe).astype(np.float32)   # H_DBS,E = w·f·q_E [Hz] (§18)
+        rate_i = (f_hz * qi).astype(np.float32)
+        vta_cache = os.path.join(cfg.dbs_output_base_dir, "vta_cache")
+        _modelb_by_target = {}
+        for _tl, _ti in _target_items:
+            w = modelb_weights(cfg.vta_atlas_nii, _ti, cfg.dbs_amplitude_ma,
+                               cfg.dbs_pulse_width_us, cfg, cache_dir=vta_cache)
+            assert w.shape[0] == n_nodes, f"w{w.shape} != n_nodes {n_nodes}"
+            _modelb_by_target[_tl] = dict(w=w.astype(np.float32), rate_e=rate_e, rate_i=rate_i)
+        _all_stim_arrays = {tl: None for tl, _ in _target_items}
+    else:
+        stimulus_modes = ("true_p_t",)
+        _modelb_by_target = {tl: None for tl, _ in _target_items}
+        # 모든 target의 stim 배열을 미리 생성 (Python 루프, 빠름)
+        _all_stim_arrays = {}
+        for _tl, _ti in _target_items:
+            _arr, _ = _build_stim_array(
+                cfg=cfg, derived=derived, target_node_index=_ti,
+                n_nodes=n_nodes, onset_step=_pre_steps, total_steps=_total_steps,
+            )
+            _all_stim_arrays[_tl] = _arr
 
     # target별로 실행 (stim 배열은 재사용, _run_single_target에 직접 전달)
     for target_label, target_node_index in _target_items:
@@ -95,8 +113,10 @@ def run_dbs_stimulation(
             n_nodes=n_nodes,
             derived=derived,
             cfg=cfg,
+            data=data,
             stimulus_modes=stimulus_modes,
             prebuilt_stim_array=_all_stim_arrays[target_label],
+            modelb=_modelb_by_target[target_label],
         )
 
     print(f"\n[DBS] All outputs saved to: {os.path.abspath(cfg.dbs_output_base_dir)}")
@@ -140,8 +160,10 @@ def _run_single_target(
     n_nodes,
     derived,
     cfg,
+    data,
     stimulus_modes,
     prebuilt_stim_array=None,  # Patch 4: 미리 빌드된 stim 배열 (None이면 내부에서 생성)
+    modelb=None,  # Model B: dict(w, rate_e, rate_i) — 시뮬은 rank-1 그대로 전달
 ) -> None:
     print(f"\n{'='*60}\nTarget: {target_label} (node {target_node_index})\n{'='*60}")
 
@@ -155,21 +177,21 @@ def _run_single_target(
     onset_step = pre_steps
 
     # Patch 4: 미리 빌드된 stim 배열이 있으면 재사용, 없으면 기존 방식으로 생성
-    if prebuilt_stim_array is not None:
+    if modelb is not None:
+        # model_b: 플롯/CSV 용 rate 배열(rank-1 outer, CPU) — 시뮬은 rank-1 그대로 전달
+        stimulation_array = np.outer(modelb["rate_e"], modelb["w"]).astype(np.float32)
+        actual_pulse_count = derived["n_pulses"]
+        stimulation_jax = None
+    elif prebuilt_stim_array is not None:
         stimulation_array = prebuilt_stim_array
         actual_pulse_count = derived["n_pulses"]
+        stimulation_jax = jnp.asarray(stimulation_array, dtype=jnp.float32)
     else:
-        stimulation_array, actual_pulse_count = _build_biphasic_pulse_train(
-            target_node_index=target_node_index,
-            n_nodes=n_nodes,
-            onset_step=onset_step,
-            amplitude=cfg.dbs_pulse_amplitude,
-            phase_duration_steps=derived["phase_duration_steps"],
-            n_pulses=derived["n_pulses"],
-            total_steps=total_steps,
-            gap_steps=derived["gap_steps"],
+        stimulation_array, actual_pulse_count = _build_stim_array(
+            cfg=cfg, derived=derived, target_node_index=target_node_index,
+            n_nodes=n_nodes, onset_step=onset_step, total_steps=total_steps,
         )
-    stimulation_jax = jnp.asarray(stimulation_array, dtype=jnp.float32)
+        stimulation_jax = jnp.asarray(stimulation_array, dtype=jnp.float32)
 
     print(
         f"[INFO] actual_pulses={actual_pulse_count}  "
@@ -186,6 +208,7 @@ def _run_single_target(
             stimulation_jax=stimulation_jax,
             cfg=cfg,
             stimulus_mode=stimulus_mode,
+            modelb=modelb,
         )
         network.dynamics.dynamics = types.MethodType(stimulated_fn, network.dynamics)
 
@@ -198,6 +221,24 @@ def _run_single_target(
             simulation_result = jax.block_until_ready(compiled_model(simulation_state))
         finally:
             network.dynamics.dynamics = original_dynamics
+
+        # 자극 타깃 노드의 neural time series CSV. 전 구간(pre+stim), stride 로 다운샘플.
+        # 전 노드×dt1ms 는 조건당 ~1.7GB 라 불가 — 타깃 노드만 남긴다.
+        if getattr(cfg, "dbs_save_neural_csv", False):
+            st = max(1, int(getattr(cfg, "dbs_neural_csv_stride", 4)))
+            nd = np.asarray(simulation_result.data, dtype=np.float32)[::st]
+            sl = np.asarray(stimulation_array, dtype=np.float32)[::st, target_node_index]
+            pd.DataFrame({
+                "time_ms": np.arange(nd.shape[0], dtype=np.float64) * cfg.integration_dt_ms * st,
+                "S_e": nd[:, 0, target_node_index],
+                "S_i": nd[:, 1, target_node_index],
+                "stim": sl[:nd.shape[0]],
+                "is_stim_on": (np.arange(nd.shape[0]) * st >= onset_step).astype(np.int8),
+            }).to_csv(os.path.join(mode_save_dir, "neural_timeseries_target.csv"),
+                      index=False, float_format="%.6g")
+            print(f"[DBS] neural CSV 저장 — {nd.shape[0]} 행 "
+                  f"(stride={st} → {1000.0/(cfg.integration_dt_ms*st):.0f} Hz), "
+                  f"node {target_node_index} ({target_label})", flush=True)
 
         observable_name = "E_plus_I"
         observable_save_dir = os.path.join(mode_save_dir, observable_name)
@@ -216,10 +257,31 @@ def _run_single_target(
             observable_name=observable_name,
         )
 
+        # 자극 전(pre) vs 자극 중(during) BOLD 기반 simulated FC + 차이 행렬 저장
+        _compute_and_save_dbs_fc(
+            simulation_result=simulation_result,
+            bundle_base=bundle_base,
+            onset_step=onset_step,
+            stim_steps=stim_steps,
+            target_label=target_label,
+            cfg=cfg,
+            data=data,
+            save_dir=mode_save_dir,
+        )
+
 
 # ── 자극 dynamics 생성 ───────────────────────────────────────
 
-def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_mode: str):
+def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_mode: str, modelb=None):
+    mb = None
+    if stimulus_mode == "model_b":
+        assert modelb is not None, "model_b 모드는 modelb=dict(w, rate_e, rate_i) 필요"
+        mb = {k: jnp.asarray(v) for k, v in modelb.items()}
+        assert mb["rate_e"].shape == mb["rate_i"].shape, "rate_e/rate_i 길이 불일치"
+        n_time = mb["rate_e"].shape[0]
+    else:
+        n_time = stimulation_jax.shape[0]
+
     def stimulated_dynamics(self, time_ms, state, params, coupling, external):
         dtype = state.dtype
         excitatory_activity = state[0]
@@ -229,95 +291,87 @@ def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_
 
         time_step_index = jnp.clip(
             jnp.round(time_ms / cfg.integration_dt_ms).astype(jnp.int32),
-            0, stimulation_jax.shape[0] - 1,
+            0, n_time - 1,
         )
-        stimulus_vector = jnp.asarray(stimulation_jax[time_step_index], dtype=dtype)
+        if stimulus_mode != "model_b":
+            stimulus_vector = jnp.asarray(stimulation_jax[time_step_index], dtype=dtype)
 
-        alpha_e = jnp.asarray(params.alpha_e, dtype=dtype)
-        alpha_i = jnp.asarray(params.alpha_i, dtype=dtype)
-        c_ee = jnp.asarray(params.c_ee, dtype=dtype)
-        c_ei = jnp.asarray(params.c_ei, dtype=dtype)
-        c_ie = jnp.asarray(params.c_ie, dtype=dtype)
-        c_ii = jnp.asarray(params.c_ii, dtype=dtype)
-        P = jnp.asarray(params.P, dtype=dtype)
-        Q = jnp.asarray(params.Q, dtype=dtype)
+        # Reduced Wong-Wang params (model.py ReducedWongWangEIB 와 동일)
+        J_N = jnp.asarray(params.J_N, dtype=dtype)
+        w_p = jnp.asarray(params.w_p, dtype=dtype)
+        c_ei = jnp.asarray(params.c_ei, dtype=dtype)   # == J_i
+        W_e = jnp.asarray(params.W_e, dtype=dtype)
+        W_i = jnp.asarray(params.W_i, dtype=dtype)
+        I_o = jnp.asarray(params.I_o, dtype=dtype)
         I_ext = jnp.asarray(params.I_ext, dtype=dtype)
-        theta_e = jnp.asarray(params.theta_e, dtype=dtype)
-        theta_i = jnp.asarray(params.theta_i, dtype=dtype)
         lamda = jnp.asarray(params.lamda, dtype=dtype)
         a_e = jnp.asarray(params.a_e, dtype=dtype)
-        a_i = jnp.asarray(params.a_i, dtype=dtype)
         b_e = jnp.asarray(params.b_e, dtype=dtype)
-        b_i = jnp.asarray(params.b_i, dtype=dtype)
-        c_e = jnp.asarray(params.c_e, dtype=dtype)
-        c_i = jnp.asarray(params.c_i, dtype=dtype)
-        k_e = jnp.asarray(params.k_e, dtype=dtype)
-        k_i = jnp.asarray(params.k_i, dtype=dtype)
-        r_e = jnp.asarray(params.r_e, dtype=dtype)
-        r_i = jnp.asarray(params.r_i, dtype=dtype)
+        d_e = jnp.asarray(params.d_e, dtype=dtype)
+        gamma_e = jnp.asarray(params.gamma_e, dtype=dtype)
         tau_e = jnp.asarray(params.tau_e, dtype=dtype)
+        a_i = jnp.asarray(params.a_i, dtype=dtype)
+        b_i = jnp.asarray(params.b_i, dtype=dtype)
+        d_i = jnp.asarray(params.d_i, dtype=dtype)
+        gamma_i = jnp.asarray(params.gamma_i, dtype=dtype)
         tau_i = jnp.asarray(params.tau_i, dtype=dtype)
-        rE_max_hz = jnp.asarray(params.rE_max_hz, dtype=dtype)
-        rI_max_hz = jnp.asarray(params.rI_max_hz, dtype=dtype)
-        clip_lo = jnp.asarray(-500.0, dtype=dtype)
-        clip_hi = jnp.asarray(500.0, dtype=dtype)
+        one = jnp.asarray(1.0, dtype=dtype)
         half = jnp.asarray(0.5, dtype=dtype)
 
-        if stimulus_mode == "true_p_t":
+        # 자극 분배: inside_stim → x_e_pre 직접 주입(I_ext 자리),
+        #            outside_stim → dS_e_dt 에 가산(TVB default 방식)
+        if stimulus_mode == "model_b":
+            # §19: rate(Hz) 를 gating 항 안에 가산 — 전류 주입 없음
+            inside_stim = jnp.zeros_like(excitatory_activity)
+            outside_stim = jnp.zeros_like(excitatory_activity)
+            w_vec = jnp.asarray(mb["w"], dtype=dtype)
+            dbs_rate_e = w_vec * mb["rate_e"][time_step_index].astype(dtype)
+            dbs_rate_i = w_vec * mb["rate_i"][time_step_index].astype(dtype)
+        elif stimulus_mode == "true_p_t":
             inside_stim = stimulus_vector
             outside_stim = jnp.zeros_like(stimulus_vector)
+            dbs_rate_e = dbs_rate_i = jnp.asarray(0.0, dtype=dtype)
         elif stimulus_mode == "tvb_default":
             inside_stim = jnp.zeros_like(stimulus_vector)
             outside_stim = stimulus_vector
+            dbs_rate_e = dbs_rate_i = jnp.asarray(0.0, dtype=dtype)
         elif stimulus_mode == "hybrid":
             inside_stim = half * stimulus_vector
             outside_stim = half * stimulus_vector
+            dbs_rate_e = dbs_rate_i = jnp.asarray(0.0, dtype=dtype)
         else:
             raise ValueError(f"Unsupported stimulus_mode: {stimulus_mode}")
 
-        excitatory_input = alpha_e * (
-            c_ee * excitatory_activity
-            - c_ei * inhibitory_activity
-            + P
+        S_e = excitatory_activity
+        S_i = inhibitory_activity
+        c_lre = J_N * long_range_excitation
+        c_ffi = J_N * feedforward_inhibition
+        J_N_S_e = J_N * S_e
+
+        # Excitatory input (c_ei == J_i). inside_stim 을 I_ext 와 같은 자리에 주입.
+        x_e_pre = (
+            w_p * J_N_S_e
+            - c_ei * S_i
+            + W_e * I_o
+            + c_lre
             + I_ext
             + inside_stim
-            - theta_e
-            + long_range_excitation
         )
-        inhibitory_input = alpha_i * (
-            c_ie * excitatory_activity
-            - c_ii * inhibitory_activity
-            + Q
-            - theta_i
-            + lamda * feedforward_inhibition
-        )
-
-        sigmoid_excitatory = c_e / (
-            jnp.asarray(1.0, dtype=dtype) + jnp.exp(-jnp.clip(a_e * (excitatory_input - b_e), clip_lo, clip_hi))
-        )
-        sigmoid_inhibitory = c_i / (
-            jnp.asarray(1.0, dtype=dtype) + jnp.exp(-jnp.clip(a_i * (inhibitory_input - b_i), clip_lo, clip_hi))
-        )
-
-        excitatory_derivative = (
-            -excitatory_activity
-            + (k_e - r_e * excitatory_activity) * sigmoid_excitatory
-        ) / tau_e
+        x_e = a_e * x_e_pre - b_e
+        H_e = _rww_H(x_e, d_e)
+        excitatory_derivative = -(S_e / tau_e) + (one - S_e) * (H_e + dbs_rate_e) * gamma_e
         excitatory_derivative = excitatory_derivative + outside_stim
 
-        inhibitory_derivative = (
-            -inhibitory_activity
-            + (k_i - r_i * inhibitory_activity) * sigmoid_inhibitory
-        ) / tau_i
+        # Inhibitory input
+        x_i_pre = J_N_S_e - S_i + W_i * I_o + lamda * c_ffi
+        x_i = a_i * x_i_pre - b_i
+        H_i = _rww_H(x_i, d_i)
+        inhibitory_derivative = -(S_i / tau_i) + (H_i + dbs_rate_i) * gamma_i
 
         return (
             jnp.stack([excitatory_derivative, inhibitory_derivative], axis=0),
-            jnp.stack([
-                sigmoid_excitatory,
-                sigmoid_inhibitory,
-                rE_max_hz * sigmoid_excitatory,
-                rI_max_hz * sigmoid_inhibitory,
-            ], axis=0),
+            # aux = [S_e, S_i, H_e(rE_hz), H_i(rI_hz)] — model.py 와 동일 레이아웃
+            jnp.stack([S_e, S_i, H_e, H_i], axis=0),
         )
 
     return stimulated_dynamics
@@ -370,11 +424,13 @@ def _analyze_and_plot(
         f"beta pre={beta_ratio_pre:.4f}  during={beta_ratio_during:.4f}"
     )
 
-    _plot_lfp_timeseries(
-        time_axis_ms, lfp_signal, onset_step, stim_end_ms,
-        target_label, derived, cfg, save_dir,
-        stimulus_mode, observable_name,
-    )
+    save_lfp = bool(getattr(cfg, "dbs_save_lfp_timeseries", False))
+    if save_lfp:
+        _plot_lfp_timeseries(
+            time_axis_ms, lfp_signal, onset_step, stim_end_ms,
+            target_label, derived, cfg, save_dir,
+            stimulus_mode, observable_name,
+        )
     _plot_stim_waveform_full(
         time_axis_ms, stimulation_array, target_node_index, target_label,
         derived, save_dir, stimulus_mode,
@@ -389,22 +445,163 @@ def _analyze_and_plot(
         target_label, cfg, save_dir,
         stimulus_mode, observable_name,
     )
-    _plot_lfp_segment_comparison(
-        lfp_pre, lfp_during, target_label, cfg, save_dir,
-        stimulus_mode, observable_name,
-    )
-
-    pd.DataFrame({
-        "time_ms": time_axis_ms,
-        "lfp_e_plus_i": lfp_signal,
-        "stimulus": stimulation_array[:, target_node_index],
-    }).to_csv(os.path.join(save_dir, "lfp_timeseries.csv"), index=False)
+    if save_lfp:
+        _plot_lfp_segment_comparison(
+            lfp_pre, lfp_during, target_label, cfg, save_dir,
+            stimulus_mode, observable_name,
+        )
+        pd.DataFrame({
+            "time_ms": time_axis_ms,
+            "lfp_e_plus_i": lfp_signal,
+            "stimulus": stimulation_array[:, target_node_index],
+        }).to_csv(os.path.join(save_dir, "lfp_timeseries.csv"), index=False)
 
     pd.DataFrame({
         "frequency_hz": freq_pre,
         "psd_pre_v2_per_hz": psd_pre,
         "psd_during_v2_per_hz": psd_during,
     }).to_csv(os.path.join(save_dir, "psd_pre_vs_during.csv"), index=False)
+
+
+# ── simulated FC (자극 전/중) ─────────────────────────────────
+
+def _fc_from_timeseries(ts_2d: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    """[n_samples, n_nodes] 시계열 → z-score Pearson FC 행렬 (대각=0).
+    파이프라인 _compute_fc_from_bold_output과 동일한 방식."""
+    ts = np.nan_to_num(np.asarray(ts_2d, dtype=np.float32))
+    ts = ts - ts.mean(axis=0, keepdims=True)
+    std = np.maximum(ts.std(axis=0, keepdims=True), eps)
+    ts_norm = ts / std
+    fc = (ts_norm.T @ ts_norm) / max(ts_norm.shape[0] - 1, 1)
+    fc = np.clip(fc, -1.0, 1.0).astype(np.float32)
+    np.fill_diagonal(fc, 0.0)
+    return fc
+
+
+def _compute_and_save_dbs_fc(
+    simulation_result,
+    bundle_base: StateBundle,
+    onset_step,
+    stim_steps,
+    target_label,
+    cfg,
+    data,
+    save_dir,
+) -> None:
+    """
+    DBS 신경 시뮬에서 BOLD 기반 simulated FC를 계산해 저장한다.
+      - 자극 전(pre) 윈도우 FC, 자극 중(during) 윈도우 FC
+      - 차이 행렬(during - pre, 원소별 변화)
+    파이프라인 simulated FC와 동일하게 BOLD monitor + z-score 상관으로 계산하며,
+    pre 윈도우는 앞 transient 구간(cfg.dbs_fc_pre_transient_skip_ms)을, during 윈도우는
+    HRF settling 만큼 앞부분을 skip한다.
+    """
+    try:
+        bold_monitor = bundle_base.build_bold_monitor(cfg)
+        bold_output = bold_monitor(simulation_result)
+        ys = np.asarray(bold_output.ys, dtype=np.float32)
+        ts = ys[:, 0, :] if ys.ndim == 3 else ys      # [n_tr, n_nodes]
+    except Exception as exc:
+        print(f"[DBS-FC] {target_label}: BOLD 생성 실패 → FC 건너뜀 ({exc})")
+        return
+
+    n_tr = int(ts.shape[0])
+    tr_ms = float(cfg.bold_repetition_time_ms)
+    pre_tr = int(round(cfg.dbs_pre_stimulation_duration_ms / tr_ms))
+    hrf_skip = int(round(getattr(cfg, "bold_hrf_duration_ms", 20_000.0) / tr_ms))
+    pre_skip = int(round(getattr(cfg, "dbs_fc_pre_transient_skip_ms", 60_000.0) / tr_ms))
+
+    # 윈도우 경계
+    #   pre   : 앞 transient(pre_skip) 만큼 버림
+    #   during: HRF settling(hrf_skip) 만큼 버림
+    pre_lo = max(0, min(pre_skip, pre_tr - 2))
+    pre_hi = min(pre_tr, n_tr)
+    dur_lo = min(pre_tr + hrf_skip, max(pre_tr, n_tr - 2))
+    dur_hi = n_tr
+
+    if pre_hi - pre_lo < 2 or dur_hi - dur_lo < 2:
+        print(
+            f"[DBS-FC] {target_label}: BOLD 샘플 부족(n_tr={n_tr}, "
+            f"pre[{pre_lo}:{pre_hi}], during[{dur_lo}:{dur_hi}]) → FC 건너뜀"
+        )
+        return
+
+    fc_pre = _fc_from_timeseries(ts[pre_lo:pre_hi])
+    fc_during = _fc_from_timeseries(ts[dur_lo:dur_hi])
+    fc_diff = (fc_during - fc_pre).astype(np.float32)
+
+    # 라벨 (가능하면 region 이름, 아니면 정수 인덱스)
+    labels = data.get("region_labels") if isinstance(data, dict) else None
+    if not labels or len(labels) != ts.shape[1]:
+        labels = [str(i) for i in range(ts.shape[1])]
+
+    # BOLD 시계열 저장 (LFP 대체 출력). TR 해상도라 163노드 × 480 TR ≈ 0.8MB.
+    # segment 열로 FC 계산에 쓰인 pre/during 윈도우를 표시한다(그 외는 skip).
+    if getattr(cfg, "dbs_save_bold_timeseries", True):
+        seg = np.full(n_tr, "skip", dtype=object)
+        seg[pre_lo:pre_hi] = "pre"
+        seg[dur_lo:dur_hi] = "during"
+        bold_df = pd.DataFrame(ts, columns=labels)
+        bold_df.insert(0, "segment", seg)
+        bold_df.insert(0, "time_s", np.arange(n_tr, dtype=np.float32) * tr_ms / 1000.0)
+        bold_df.insert(0, "tr_index", np.arange(n_tr, dtype=np.int32))
+        bold_df.to_csv(os.path.join(save_dir, "bold_timeseries.csv"), index=False)
+
+    pd.DataFrame(fc_pre, index=labels, columns=labels).to_csv(
+        os.path.join(save_dir, "fc_pre_stim.csv"))
+    pd.DataFrame(fc_during, index=labels, columns=labels).to_csv(
+        os.path.join(save_dir, "fc_during_stim.csv"))
+    pd.DataFrame(fc_diff, index=labels, columns=labels).to_csv(
+        os.path.join(save_dir, "fc_diff_during_minus_pre.csv"))
+
+    # off-diagonal 요약 통계
+    iu = np.triu_indices(fc_pre.shape[0], k=1)
+    pre_v, dur_v, diff_v = fc_pre[iu], fc_during[iu], fc_diff[iu]
+    fc_corr_pre_during = (
+        float(np.corrcoef(pre_v, dur_v)[0, 1]) if pre_v.size > 1 else float("nan")
+    )
+    pd.DataFrame({
+        "metric": [
+            "n_tr_total", "pre_window_tr", "during_window_tr",
+            "mean_fc_pre", "mean_fc_during",
+            "mean_diff_during_minus_pre", "mean_abs_diff", "max_abs_diff",
+            "corr_pre_vs_during",
+        ],
+        "value": [
+            n_tr, pre_hi - pre_lo, dur_hi - dur_lo,
+            float(pre_v.mean()), float(dur_v.mean()),
+            float(diff_v.mean()), float(np.abs(diff_v).mean()), float(np.abs(diff_v).max()),
+            fc_corr_pre_during,
+        ],
+    }).to_csv(os.path.join(save_dir, "fc_summary.csv"), index=False)
+
+    print(
+        f"[DBS-FC] {target_label}: pre[{pre_lo}:{pre_hi}] during[{dur_lo}:{dur_hi}]  "
+        f"mean|Δ|={np.abs(diff_v).mean():.4f}  max|Δ|={np.abs(diff_v).max():.4f}  "
+        f"corr(pre,during)={fc_corr_pre_during:.4f}"
+    )
+
+    _plot_dbs_fc(fc_pre, fc_during, fc_diff, target_label, save_dir)
+
+
+def _plot_dbs_fc(fc_pre, fc_during, fc_diff, target_label, save_dir) -> None:
+    dmax = float(np.nanmax(np.abs(fc_diff))) if np.isfinite(fc_diff).any() else 1.0
+    dmax = dmax if dmax > 0 else 1.0
+    panels = [
+        (fc_pre,    "Pre-stim FC",          -1.0,  1.0),
+        (fc_during, "During-stim FC",       -1.0,  1.0),
+        (fc_diff,   "ΔFC (during − pre)",  -dmax, dmax),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    for ax, (mat, title, vlo, vhi) in zip(axes, panels):
+        im = ax.imshow(mat, cmap="RdBu_r", vmin=vlo, vmax=vhi, aspect="equal")
+        ax.set_title(f"{target_label} | {title}")
+        ax.set_xlabel("Region")
+        ax.set_ylabel("Region")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "fc_pre_during_diff.png"), dpi=150)
+    plt.show()
 
 
 # ── observable ───────────────────────────────────────────────
@@ -624,7 +821,34 @@ def _print_stimulation_summary(cfg: Config, derived: dict) -> None:
     )
     print(f"  pre_dur        = {cfg.dbs_pre_stimulation_duration_ms / 1000:.0f}s")
     print(f"  stim_dur       = {cfg.dbs_stimulation_duration_ms / 1000:.0f}s")
+    if getattr(cfg, "dbs_std_enable", False):
+        print(f"  STD            = ON (U={cfg.dbs_std_U}, tau_rec={cfg.dbs_std_tau_rec_ms}ms, "
+              f"tau_fac={cfg.dbs_std_tau_fac_ms}ms, tau_syn={cfg.dbs_std_tau_syn_ms}ms) "
+              f"— biphasic 대신 단극성 시냅스 전류")
     print("=" * 60)
+
+
+def _build_stim_array(cfg: Config, derived: dict, target_node_index: int,
+                      n_nodes: int, onset_step: int, total_steps: int) -> tuple:
+    """자극 배열 생성 분기: STD 시냅스 전달(dbs_std_enable) vs 원 biphasic 파형."""
+    if getattr(cfg, "dbs_std_enable", False):
+        arr = build_std_drive(
+            target_node_index=target_node_index, n_nodes=n_nodes,
+            onset_step=onset_step, total_steps=total_steps,
+            period_steps=derived["period_steps"], n_pulses=derived["n_pulses"],
+            cfg=cfg,
+        )
+        return arr, derived["n_pulses"]
+    return _build_biphasic_pulse_train(
+        target_node_index=target_node_index,
+        n_nodes=n_nodes,
+        onset_step=onset_step,
+        amplitude=cfg.dbs_pulse_amplitude,
+        phase_duration_steps=derived["phase_duration_steps"],
+        n_pulses=derived["n_pulses"],
+        total_steps=total_steps,
+        gap_steps=derived["gap_steps"],
+    )
 
 
 def _build_biphasic_pulse_train(
