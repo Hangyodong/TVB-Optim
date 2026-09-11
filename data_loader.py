@@ -158,15 +158,25 @@ _AAL3_SUBCORTEX_LABELS = frozenset({
     "STN_L", "STN_R",
 })
 
+# DK+PD25 (DesikanCortexPD25 82노드): cortex 도 L_/R_ prefix 라 prefix 방식 불가 →
+# subcortex 16개를 명시 집합으로 판정 (AAL3 방식과 동일 분기 재사용).
+_DKPD25_SUBCORTEX_LABELS = frozenset({
+    "L_red_nucleus", "R_red_nucleus", "L_substantia_nigra", "R_substantia_nigra",
+    "L_subthalamic_nucleus", "R_subthalamic_nucleus", "L_caudate", "R_caudate",
+    "L_putamen", "R_putamen", "L_globus_pallidus_externa", "R_globus_pallidus_externa",
+    "L_globus_pallidus_interna", "R_globus_pallidus_interna", "L_thalamus", "R_thalamus",
+})
+_SUBCORTEX_LABEL_SET = _AAL3_SUBCORTEX_LABELS | _DKPD25_SUBCORTEX_LABELS
+
 
 def derive_cortex_subcortex_indices(region_labels):
     labels = [str(l).strip() for l in region_labels]
     # AAL3 판정: cortex prefix 가 하나도 없고 AAL3 subcortex 이름이 보이면 집합 방식으로 전환.
     # (Schaefer/mouse 는 prefix 가 잡히므로 기존 경로 그대로)
     if (not any(l.startswith(_CORTEX_LABEL_PREFIXES) for l in labels)
-            and any(l in _AAL3_SUBCORTEX_LABELS for l in labels)):
-        cortex    = [i for i, l in enumerate(labels) if l not in _AAL3_SUBCORTEX_LABELS]
-        subcortex = [i for i, l in enumerate(labels) if l in _AAL3_SUBCORTEX_LABELS]
+            and any(l in _SUBCORTEX_LABEL_SET for l in labels)):
+        cortex    = [i for i, l in enumerate(labels) if l not in _SUBCORTEX_LABEL_SET]
+        subcortex = [i for i, l in enumerate(labels) if l in _SUBCORTEX_LABEL_SET]
     else:
         cortex    = [i for i, l in enumerate(labels) if l.startswith(_CORTEX_LABEL_PREFIXES)]
         subcortex = [i for i, l in enumerate(labels) if not l.startswith(_CORTEX_LABEL_PREFIXES)]

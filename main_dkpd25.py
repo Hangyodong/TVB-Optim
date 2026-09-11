@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
 """
-main_ppmi_pd.py — EI Tuning 파이프라인 (AAL163 ComBat PD: 163노드 FC/SC_weight/SC_length from .mat)
+main_dkpd25.py — EI Tuning 파이프라인 (DK+PD25 82노드 PD: FC_raw/SC_weight/SC_length from .mat)
 
 Usage:
-    python3 main_ppmi_pd.py                          # subject idx=0, noise=0.02
-    python3 main_ppmi_pd.py --subject-idx 5          # N번째 subject (0-based, 0~241)
-    python3 main_ppmi_pd.py --noise-level 0.0        # 무잡음
-    python3 main_ppmi_pd.py --fic-only               # FIC만 실행
-    python3 main_ppmi_pd.py --enable-sigma           # Part3.5 σ 튜닝 켜기 (기본 skip)
-    python3 main_ppmi_pd.py --enable-dbs             # Part4 DBS 켜기 (기본 skip)
+    python3 main_dkpd25.py                          # subject idx=0, noise=0.02
+    python3 main_dkpd25.py --subject-idx 5          # N번째 subject (0-based, 0~178)
+    python3 main_dkpd25.py --noise-level 0.0        # 무잡음
+    python3 main_dkpd25.py --fic-only               # FIC만 실행
+    python3 main_dkpd25.py --enable-sigma           # Part3.5 σ 튜닝 켜기 (기본 skip)
+    python3 main_dkpd25.py --enable-dbs             # Part4 DBS 켜기 (기본 skip)
 
 Part 1(FIC) / 2(EIB) / 3(Gradient) 는 기본 실행, --skip-{fic,eib,gradient} 로 끈다.
 Part 3.5(σ 튜닝) / 4(DBS) 는 기본 skip, --enable-{sigma,dbs} 로 켠다.
 (--enable-sigma 는 Part3 출력에 의존 → --skip-gradient 와 함께 쓰면 자동 skip)
 
-data/AALv3/FC_AAL_ComBat_all_163_PD.mat 의 FC_ComBat struct array(242명 PD)에서
-subject_idx 번째를 추출. 필드: subject(id), group(PD), FC(ComBat harmonized corr),
-SC_weight(raw streamline), SC_length(mm), TR(2.5), labels(AAL idx).
-행렬은 163×163 (AAL3v1_1mm_PD25stn 축약 163노드; FC off-diag NaN 0 → DROP 불필요).
-노드 순서는 라벨파일(AAL163_labels.txt) 줄 순서 = .mat 노드 순서(aal_code 로 검증).
+data/DK+PD25/FC_DKPD25_82_ppmi_all_nomed_qc.mat 의 data struct array(238명 = PD179+HC59)에서
+group==PD 필터 후 subject_idx 번째를 추출. 필드: subject(id), group(PD/HC),
+FC_raw(Pearson raw corr, ComBat 없음), SC_weight(raw streamline), SC_length(mm),
+TR(2.5), labels(1..82 identity).
+행렬은 82×82 (DesikanCortexPD25: DK cortex 66 + PD25 subcortex 16; FC 결측 노드 없음 → DROP 불필요).
+노드 순서는 .mat 내장 region_names 줄 순서 = .mat 노드 순서(labels 1..82 identity 로 검증).
 
-cortex 112 / subcortex 51 로 분리된다(data_loader._AAL3_SUBCORTEX_LABELS 기준):
-subcortex = basal ganglia + thalamus + VTA/SN/Red_N/LC/Raphe + STN.
-Cerebellum·Vermis, Hippocampus, Amygdala, ACC_* 는 cortex 로 분류(사용자 결정).
+cortex 66 / subcortex 16 으로 분리된다(data_loader._DKPD25_SUBCORTEX_LABELS 기준):
+subcortex = STN/GPe/GPi/Putamen/Caudate/Thalamus/SN/Red_N 좌우 8쌍.
 
-출력은 output_ppmi_pd/<sub_num>/ 아래 inputs/ figures/ cache/ (+DBS 시 dbs_analysis/) 로 저장된다.
-DBS 타깃은 STN_L/R + GP_L/R(Pallidum) — AAL3 에 GPe/GPi 구분이 없어 통합 Pallidum 을 쓴다.
+출력은 output_dkpd25/<sub_num>/ 아래 inputs/ figures/ cache/ (+DBS 시 dbs_analysis/) 로 저장된다.
+DBS 타깃은 STN_L/R + GPe_L/R + GPi_L/R — PD25 subcortex 라벨에 GPe/GPi 구분이 있어 그대로 쓴다.
 """
 import argparse
 import os
@@ -50,7 +50,7 @@ matplotlib.use("Agg")  # 화면 없이 저장만
 import matplotlib.pyplot as _plt
 import pathlib as _pl, re as _re
 
-# figure 출력 폴더는 main()에서 sub_num 확정 후 설정 (output_ppmi_pd/<sub_num>/figures).
+# figure 출력 폴더는 main()에서 sub_num 확정 후 설정 (output_dkpd25/<sub_num>/figures).
 _FIG = {"dir": None}
 _fig_counter = {"n": 0}
 
@@ -101,34 +101,28 @@ from pipeline_contracts  import (
     capture_network_delay_history,
 )
 
-# ── PD .mat 경로 ─────────────────────────────────────────────────────────
-MAT_PATH   = "data/AALv3/FC_AAL_all_163_final.mat"   # 최종 코호트(2026-08-07). ts(BOLD)+UPDRS3 포함
-# FC_ComBat: struct array (1, 240) = PD 187 + CTR 53. 각 entry 에 harmonized FC +
-# SC_weight + SC_length 가 모두 들어있다(단일 파일 완결, 163노드). subject_idx 는
-# group==GROUP_FILTER 필터 후 순서(0~186).
-# ⚠ 구 FC_AAL_ComBat_all_163.mat(PD 242) 대비 idx 재배열: idx0~8 은 subject 동일,
-#   101038(구 idx9)·101175(구 idx14) 가 탈락해 구 idx10~13 → 현 idx9~12 로 −1 시프트.
-#   FC 값도 187명 코호트로 ComBat 재적합돼 max|Δ|≈0.001~0.01 → cache_tag 전부 새로 잡힌다.
-#   필드: subject(str id), group(PD), FC(163x163 ComBat harmonized),
-#         SC_weight(163x163 streamline), SC_length(163x163 mm), labels(AAL idx), TR.
-MAT_KEY    = "FC_ComBat"
-GROUP_FILTER = "PD"              # PD 코호트만 (현재 파일은 242 PD 전부 → 필터는 안전장치)
-N_NODES_RAW = 163                # AAL163: AAL3v1_1mm_PD25stn 축약 163노드
-# 163 아틀라스는 FC 결측 노드(구 Thal_Re_L 등)를 이미 제외 → FC off-diag NaN 0 → DROP 불필요.
-# (구 168노드는 Thal_Re_L 을 런타임 제거해 167 로 돌렸으나, 이제 파일 자체가 clean.)
-DROP_LABELS = ()                 # 제거할 노드 없음 (필요 시 라벨 이름으로 추가)
-N_NODES    = N_NODES_RAW - len(DROP_LABELS)   # 163
-OUTPUT_DIR = "output_ppmi_pd"    # 결과 루트: output_ppmi_pd/<sub_num>/
-LABEL_SRC  = "data/AALv3/AAL163_labels.txt"   # TSV: "idx<TAB>aal_code<TAB>region" (헤더 있음)
+# ── DK+PD25 .mat 경로 ────────────────────────────────────────────────────
+MAT_PATH   = "data/DK+PD25/FC_DKPD25_82_ppmi_all_nomed_qc.mat"
+# struct array (1,238) = PD 179 + HC 59 (nomed_qc, dwi_qc 전원 pass).
+# 필드: subject/group/TR(2.5)/nvol(240)/FC_raw(82×82 Pearson)/FC_raw_z/SC_weight/SC_length
+#       /updrs3(+tremor/rigidity/brady). ComBat 없음 → FC_raw 를 타깃으로 쓴다.
+MAT_KEY    = "data"
+GROUP_FILTER = "PD"              # PD 코호트만 (subject_idx = PD 필터 후 0~178)
+N_NODES_RAW = 82                 # DK cortex 66 + PD25 subcortex 16
+DROP_LABELS = ()                 # FC 결측 노드 없음
+N_NODES    = N_NODES_RAW - len(DROP_LABELS)
+OUTPUT_DIR = "output_dkpd25"
+# 라벨은 .mat region_names 에 내장 (별도 txt 없음). atlas label_id = node_index+1 (아래 assert).
+ATLAS_NII  = "data/DK+PD25/DesikanCortexPD25_space-MNI152NLin6_res-2x2x2.nii.gz"
 
-# Part4 DBS 타깃 = AAL3 라벨 이름 매칭. AAL3 에는 GPe/GPi 구분이 없고 Pallidum_L/R 뿐이라
-# 기존 GPe_*/GPi_* 대신 통합 GP_* 로 잡는다 (사용자 결정).
-# config.py 기본값(STN_L:11 등)은 mouse 인덱스라 PD 에 쓰면 cortex 를 자극한다 → 반드시 덮어쓸 것.
+# Part4 DBS 타깃 (PD25 subcortex 라벨 이름, lower-case 매칭)
 DBS_TARGET_LABELS = {
-    "STN_L": "stn_l",
-    "STN_R": "stn_r",
-    "GP_L":  "pallidum_l",
-    "GP_R":  "pallidum_r",
+    "STN_L": "l_subthalamic_nucleus",
+    "STN_R": "r_subthalamic_nucleus",
+    "GPi_L": "l_globus_pallidus_interna",
+    "GPi_R": "r_globus_pallidus_interna",
+    "GPe_L": "l_globus_pallidus_externa",
+    "GPe_R": "r_globus_pallidus_externa",
 }
 
 
@@ -147,7 +141,7 @@ def _dbs_targets_from_labels(labels: list) -> dict:
 # ── 2. 인자 파싱 ─────────────────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="EI Tuning Pipeline (AAL163 ComBat PD: 163 nodes from .mat)")
+        description="EI Tuning Pipeline (DK+PD25 82 nodes from .mat)")
     parser.add_argument("--subject-idx", dest="subject_idx", type=int, default=0,
                         help="사용할 subject 0-based index (0 ~ N-1)")
     parser.add_argument("--noise-level", dest="noise_level", type=float, default=0.02,
@@ -198,30 +192,21 @@ def parse_args():
 
 # ── 3. PD .mat → CSV 추출 ────────────────────────────────────────────────
 def _load_region_labels() -> list:
-    """AAL163_labels.txt (TSV: "idx<TAB>aal_code<TAB>region" 헤더 + 163행) → region 이름 리스트.
-
-    행 순서 = .mat FC/SC 노드 순서 (txt 의 aal_code 열이 .mat labels 정수와 일치함으로 검증).
-    헤더에 'region' 열이 있으면 그 열을, 없으면(구 형식) 마지막 열을 이름으로 쓴다.
-    """
-    with open(LABEL_SRC, "r", encoding="utf-8-sig") as fh:
-        rows = [ln.strip() for ln in fh if ln.strip()]
-    if not rows:
-        return []
-    header = rows[0].split("\t")
-    if "region" in header:
-        col, body = header.index("region"), rows[1:]   # TSV + 헤더
-    else:
-        col, body = -1, rows                            # 헤더 없는 구 형식 → 마지막 컬럼
-    labels = []
-    for ln in body:
-        parts = ln.split("\t") if "\t" in ln else ln.split()
-        labels.append(parts[col].strip())
-    return labels
+    """.mat region_names → 이름 리스트(82). labels==1..82 (node_index=label_id-1) 를 검증한다
+    — vta.py 의 아틀라스 매핑이 이 가정에 의존한다."""
+    import numpy as _np
+    import scipy.io as _sio
+    m = _sio.loadmat(MAT_PATH)
+    names = [str(_np.asarray(x).ravel()[0]).strip() for x in m["region_names"].ravel()]
+    labs = _np.asarray(m["labels"]).ravel().astype(int)
+    assert list(labs) == list(range(1, len(names) + 1)), \
+        "atlas label_id != node_index+1 — VTA 매핑 가정 붕괴"
+    return names
 
 
 def _load_pd_entries():
-    """FC_ComBat(299건)에서 group==GROUP_FILTER 인 entry 를 파일 순서대로 반환(PD 242).
-    subject_idx 가 이 리스트의 인덱스(0~241). CTR 은 인터리브돼 있어 필터로 뽑는다."""
+    """data(238건 = PD 179 + HC 59)에서 group==GROUP_FILTER 인 entry 를 파일 순서대로 반환(PD 179).
+    subject_idx 가 이 리스트의 인덱스(0~178). HC 는 인터리브돼 있어 필터로 뽑는다."""
     import numpy as _np
     import scipy.io as _sio
     m = _sio.loadmat(MAT_PATH)
@@ -235,8 +220,8 @@ def _load_pd_entries():
 
 
 def prepare_pd_data(subject_idx: int, noise_level: float) -> dict:
-    """FC_ComBat(FC_AAL_ComBat_all_163_PD.mat) 의 PD subject_idx 번째 데이터(FC/SC_weight/SC_length)를
-    output_ppmi_pd/<sub_num>/inputs/ 에 CSV 로 추출하고 make_config 용 dict 를 반환한다."""
+    """data(FC_DKPD25_82_ppmi_all_nomed_qc.mat) 의 PD subject_idx 번째 데이터(FC_raw/SC_weight/SC_length)를
+    output_dkpd25/<sub_num>/inputs/ 에 CSV 로 추출하고 make_config 용 dict 를 반환한다."""
     import numpy as _np
 
     entries = _load_pd_entries()
@@ -244,16 +229,17 @@ def prepare_pd_data(subject_idx: int, noise_level: float) -> dict:
     assert 0 <= subject_idx < N, f"subject_idx must be 0..{N-1}, got {subject_idx} ({GROUP_FILTER} {N}명)"
 
     s = entries[subject_idx]
-    sub_num = int(str(_np.asarray(s["subject"]).ravel()[0]).strip())
-    # 단일 파일(FC_ComBat)에서 harmonized FC + SC_weight + SC_length 를 모두 읽는다.
+    # subject 필드는 BIDS 스타일 "sub-100001" (AAL163 의 순수 숫자 문자열과 다름) → 접두어 제거 후 int.
+    sub_num = int(str(_np.asarray(s["subject"]).ravel()[0]).strip().removeprefix("sub-"))
+    # 단일 파일(data)에서 FC_raw + SC_weight + SC_length 를 모두 읽는다.
     # nan_to_num 은 DROP_LABELS 제거 뒤에 한다 — 먼저 0 으로 덮으면 결측을 진단할 수 없다.
     SC  = _np.asarray(s["SC_weight"], dtype=_np.float64)   # streamline count
-    FC  = _np.asarray(s["FC"],        dtype=_np.float64)   # ComBat harmonized
+    FC  = _np.asarray(s["FC_raw"],    dtype=_np.float64)   # Pearson (ComBat 없음)
     LEN = _np.asarray(s["SC_length"], dtype=_np.float64)   # mm
     n_raw = SC.shape[0]
     assert SC.shape == FC.shape == LEN.shape == (n_raw, n_raw), (
         f"matrix shape mismatch: SC{SC.shape} FC{FC.shape} LEN{LEN.shape}")
-    assert n_raw == N_NODES_RAW, f"n_nodes {n_raw} != expected {N_NODES_RAW} (AAL3 raw)"
+    assert n_raw == N_NODES_RAW, f"n_nodes {n_raw} != expected {N_NODES_RAW} (DK+PD25)"
 
     # ── DROP_LABELS 노드 제거 (라벨 이름 기준 → SC/FC/LEN/labels 동시에) ──────
     labels_raw = _load_region_labels()
@@ -266,9 +252,9 @@ def prepare_pd_data(subject_idx: int, noise_level: float) -> dict:
     SC, FC, LEN = SC[_ix], FC[_ix], LEN[_ix]
     labels = [labels_raw[i] for i in keep]
     n = len(keep)
-    assert n == N_NODES, f"n_nodes {n} != expected {N_NODES} (AAL3, {len(DROP_LABELS)}개 제거 후)"
+    assert n == N_NODES, f"n_nodes {n} != expected {N_NODES} (DK+PD25, {len(DROP_LABELS)}개 제거 후)"
 
-    # 제거 후에도 남은 FC 결측 경고 (subject 에 따라 Cerebellum 일부가 전체 NaN 인 경우가 있다)
+    # 제거 후에도 남은 FC 결측 경고 (subject 에 따라 특정 노드가 전체 NaN 인 경우가 있다)
     _off = ~_np.eye(n, dtype=bool)
     _n_nan = int(_np.isnan(FC[_off]).sum())
     if _n_nan:
@@ -303,13 +289,13 @@ def prepare_pd_data(subject_idx: int, noise_level: float) -> dict:
     # DBS 타깃은 제거 후 labels 기준 → 삭제 노드 뒤 인덱스가 자동으로 당겨진다.
     dbs_targets = _dbs_targets_from_labels(labels)
 
-    print(f"Dataset: AALv3 TR_2.5_PD  (subject idx={subject_idx}/{N}, sub_num={sub_num})")
+    print(f"Dataset: DK+PD25 TR_2.5_PD  (subject idx={subject_idx}/{N}, sub_num={sub_num})")
     print(f"  dropped -> {[f'{l}(raw node {i})' for i, l in dropped]}  → {n_raw} - {len(dropped)} = {n} nodes")
     print(f"  n_nodes={n}  cortex={n_ctx}  subcortex={len(sub_idx)}")
     print(f"  SC     -> {sc_csv}   (max={SC.max():.0f})")
     print(f"  length -> {len_csv}  (max={LEN.max():.1f}mm)")
     print(f"  FC     -> {fc_csv}   (range=[{FC.min():.2f},{FC.max():.2f}])")
-    print(f"  labels -> {reg_txt}  (src={LABEL_SRC})")
+    print(f"  labels -> {reg_txt}  (src=.mat region_names)")
     print(f"  out_dir-> {out_dir}")
     print(f"  DBS targets (0-based) -> {dbs_targets}")
 
@@ -336,12 +322,12 @@ def make_config(p: dict, subject_idx: int, use_delay: bool = True,
         sc_csv       = p["sc_csv"],
         length_csv   = p["length_csv"],
         fc_csv       = p["fc_csv"],
-        # ── 캐시: output_ppmi_pd/<sub_num>/cache 로 라우팅 ────────
+        # ── 캐시: output_dkpd25/<sub_num>/cache 로 라우팅 ────────
         # cache_run_label 이 절대경로면 data_loader 의 set_cache_path(join(cache_root, label/tag))
         # 에서 절대경로가 root 를 무시 → 캐시가 out_dir/cache/<cache_tag>/ 에 저장됨.
         cache_run_label = os.path.join(p["out_dir"], "cache"),
-        # aal 태그로 기존 schaefer 캐시(v_pd100_*/v_pd200_*)와 분리
-        cache_version   = f"v_pdaal163_tr25_s{subject_idx}",   # AAL163 ComBat harmonized
+        # dkpd25 태그로 기존 schaefer/aal163 캐시(v_pd100_*/v_pdaal163_*)와 분리
+        cache_version   = f"v_dkpd25_tr25_s{subject_idx}",   # DK+PD25 FC_raw (ComBat 없음)
 
         # ── 시뮬레이션 공통 ──────────────────────────────────────
         integration_dt_ms                   = 1.0,
@@ -426,6 +412,7 @@ def make_config(p: dict, subject_idx: int, use_delay: bool = True,
         dbs_stimulation_duration_ms         = 600_000,
 
         wc_c_ei_init                        = p["wc_c_ei_init"],
+        vta_atlas_nii                       = ATLAS_NII,
     )
     if conduction_speed is not None:
         cfg.tract_conduction_speed = conduction_speed
@@ -442,7 +429,7 @@ def main():
     args = parse_args()
 
     print("=" * 60)
-    print(f"  EI Tuning Pipeline — AALv3 TR_2.5_PD ({N_NODES} nodes) "
+    print(f"  EI Tuning Pipeline — DK+PD25 TR_2.5_PD ({N_NODES} nodes) "
           f"(subject_idx={args.subject_idx})")
     print("=" * 60)
 
@@ -567,7 +554,7 @@ def main():
         if not cfg.dbs_target_regions:
             raise SystemExit(
                 "[4] --enable-dbs 인데 DBS 타깃이 비었다. "
-                f"라벨({LABEL_SRC})에 "
+                f"라벨(.mat region_names)에 "
                 f"{list(DBS_TARGET_LABELS.values())} 이름이 있는지 확인할 것.")
         print(f"\n[4] Running DBS Stimulation... targets={cfg.dbs_target_regions}")
         run_dbs_stimulation(network=network, bundle_in=bundle_grad, cfg=cfg, data=data)

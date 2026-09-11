@@ -10,7 +10,7 @@ Usage:
 import ast, json, sys, textwrap, pathlib
 import numpy as np
 
-ROOT = pathlib.Path('/scratch/home/wog3597/optim')
+ROOT = pathlib.Path(__file__).resolve().parent
 PASS_LIST, FAIL_LIST = [], []
 
 # ── helpers (defined FIRST) ───────────────────────────────────

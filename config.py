@@ -218,6 +218,12 @@ class Config:
     dbs_pulse_amplitude:             float = 1.0
     dbs_stimulation_frequency_hz:    float = 130.0
     dbs_phase_duration_steps:        int   = 1
+    # STD(Tsodyks-Markram) 시냅스 전달: 펄스열 → 단극성 유효 전류 (dbs_std.py)
+    dbs_std_enable:                  bool  = False
+    dbs_std_U:                       float = 0.5    # utilization
+    dbs_std_tau_rec_ms:              float = 800.0  # recovery (depressing)
+    dbs_std_tau_fac_ms:              float = 0.0    # 0 = facilitation 없음
+    dbs_std_tau_syn_ms:              float = 5.0    # 시냅스 전류 exp 커널
     dbs_pre_stimulation_duration_ms: float = 720_000.0
     dbs_stimulation_duration_ms:     float = 60_000.0
     dbs_fc_pre_transient_skip_ms:    float = 60_000.0   # pre-stim FC에서 버릴 앞부분 transient
@@ -238,6 +244,26 @@ class Config:
     gpu_batch_size: int = 1
     posthoc_parallel: bool = False
     dbs_parallel_targets: bool = False
+
+    # ── Part 4 — Model B: VTA spillover + TM E/I (Final_Model_B 문서) ────────
+    # True → part4 가 biphasic 전류 대신 w_i·f·q(t) rate 를 RWW gating 에 가산(model_b 모드).
+    dbs_modelb_enable:        bool  = False
+    dbs_amplitude_ma:         float = 2.0    # 임상 mA — VTA 반경으로만 작용(§7), RWW 직접 주입 금지
+    dbs_pulse_width_us:       float = 60.0   # PW — E_th(PW) 로만 작용
+    vta_atlas_nii:            str   = ""     # DK+PD25 라벨 NIfTI 경로 (runner 가 주입)
+    vta_sigma_s_per_m:        float = 0.2    # 등방 조직 전도도 (문헌 GM 대표값)
+    # ponytail: point-source 반경 보정 knob — 기본값은 r(2mA,60µs)≈2.5mm (문헌 VTA 스케일) 재현
+    vta_e_rheobase_v_per_m:   float = 60.0
+    vta_chronaxie_us:         float = 65.0
+    vta_contact_index:        int   = 1      # 0~3 (Medtronic 3389), 1 = active contact 가 target centroid
+    vta_contact_spacing_mm:   float = 2.0    # 3389: contact 1.5mm + gap 0.5mm
+    vta_lead_tilt_deg:        float = 20.0   # canonical lead 시상면 lateral 기울기
+    dbs_tm_U_e:               float = 0.5    # E: depressing (dbs_std 기본과 동일)
+    dbs_tm_tau_rec_e_ms:      float = 800.0
+    dbs_tm_tau_fac_e_ms:      float = 0.0
+    dbs_tm_U_i:               float = 0.15   # I: facilitating (Markram-type 대표값)
+    dbs_tm_tau_rec_i_ms:      float = 138.0
+    dbs_tm_tau_fac_i_ms:      float = 670.0
 
     def get_baseline_settle_duration_ms(self) -> int:
         if self.baseline_settle_duration_ms is not None:

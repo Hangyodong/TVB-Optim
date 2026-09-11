@@ -16,7 +16,7 @@ cd /scratch/home/wog3597/optim
 
 GPU=${1:-0}       # 인자1: GPU id (기본 0)
 START=${2:-0}     # 인자2: 시작 idx (기본 0)
-END=${3:-241}     # 인자3: 끝 idx 포함 (기본 241 = 242명 마지막)
+END=${3:-186}     # 인자3: 끝 idx 포함 (기본 186 = PD 187명 마지막, final .mat)
 
 LOGDIR=output_ppmi_pd/_logs
 mkdir -p "$LOGDIR"

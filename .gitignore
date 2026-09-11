@@ -14,6 +14,8 @@ all_figures_export_*/
 output_ppmi_pd/
 output_ppmi_ctr/
 output_hcp/
+output_dkpd25/
+output_mouse116/
 anaconda_projects/
 
 # 입력 데이터 (AALv3 478MB, Schaeffer 722MB)
@@ -24,6 +26,7 @@ pd/
 
 # 노트북이 뱉는 그림·패키징 산출물
 [0-9][0-9][0-9]_*.png
+[0-9][0-9][0-9][0-9]_*.png
 hyp_*.png
 edgefit_*.png
 *.tar.gz
@@ -40,3 +43,4 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 *.swp
+docs/superpowers/

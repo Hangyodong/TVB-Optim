@@ -25,6 +25,7 @@ from tvboptim.experimental.network_dynamics import prepare
 from tvboptim.experimental.network_dynamics.solvers import BoundedSolver, Heun
 
 from config import Config
+from dbs_std import build_std_drive
 from model import _rww_H
 from pipeline_contracts import StateBundle, build_bundle_from_legacy_state
 
@@ -55,8 +56,6 @@ def run_dbs_stimulation(
     solver_dbs = BoundedSolver(Heun(), low=0.0, high=1.0)
     original_dynamics = network.dynamics.dynamics
 
-    stimulus_modes = ("true_p_t",)
-
     if getattr(cfg, 'dbs_parallel_targets', False):
         print(
             "[DBS] cfg.dbs_parallel_targets=True 감지: "
@@ -69,20 +68,38 @@ def run_dbs_stimulation(
     _stim_steps = derived["n_pulses"] * derived["period_steps"]
     _total_steps = _pre_steps + _stim_steps
 
-    # 모든 target의 stim 배열을 미리 생성 (Python 루프, 빠름)
-    _all_stim_arrays = {}
-    for _tl, _ti in _target_items:
-        _arr, _ = _build_biphasic_pulse_train(
-            target_node_index=_ti,
-            n_nodes=n_nodes,
-            onset_step=_pre_steps,
-            amplitude=cfg.dbs_pulse_amplitude,
-            phase_duration_steps=derived["phase_duration_steps"],
-            n_pulses=derived["n_pulses"],
-            total_steps=_total_steps,
-            gap_steps=derived["gap_steps"],
-        )
-        _all_stim_arrays[_tl] = _arr
+    if getattr(cfg, "dbs_modelb_enable", False):
+        # ── Model B: 공간(w=VTA spillover) × 시간(TM q) 선계산 (§23 iteration 구조) ──
+        from dbs_tm import tm_q_trace
+        from vta import modelb_weights
+        stimulus_modes = ("model_b",)
+        dt = cfg.integration_dt_ms
+        f_hz = derived["freq_actual_hz"]
+        qe = tm_q_trace(_total_steps, _pre_steps, derived["period_steps"], derived["n_pulses"],
+                        dt, cfg.dbs_tm_U_e, cfg.dbs_tm_tau_rec_e_ms, cfg.dbs_tm_tau_fac_e_ms)
+        qi = tm_q_trace(_total_steps, _pre_steps, derived["period_steps"], derived["n_pulses"],
+                        dt, cfg.dbs_tm_U_i, cfg.dbs_tm_tau_rec_i_ms, cfg.dbs_tm_tau_fac_i_ms)
+        rate_e = (f_hz * qe).astype(np.float32)   # H_DBS,E = w·f·q_E [Hz] (§18)
+        rate_i = (f_hz * qi).astype(np.float32)
+        vta_cache = os.path.join(cfg.dbs_output_base_dir, "vta_cache")
+        _modelb_by_target = {}
+        for _tl, _ti in _target_items:
+            w = modelb_weights(cfg.vta_atlas_nii, _ti, cfg.dbs_amplitude_ma,
+                               cfg.dbs_pulse_width_us, cfg, cache_dir=vta_cache)
+            assert w.shape[0] == n_nodes, f"w{w.shape} != n_nodes {n_nodes}"
+            _modelb_by_target[_tl] = dict(w=w.astype(np.float32), rate_e=rate_e, rate_i=rate_i)
+        _all_stim_arrays = {tl: None for tl, _ in _target_items}
+    else:
+        stimulus_modes = ("true_p_t",)
+        _modelb_by_target = {tl: None for tl, _ in _target_items}
+        # 모든 target의 stim 배열을 미리 생성 (Python 루프, 빠름)
+        _all_stim_arrays = {}
+        for _tl, _ti in _target_items:
+            _arr, _ = _build_stim_array(
+                cfg=cfg, derived=derived, target_node_index=_ti,
+                n_nodes=n_nodes, onset_step=_pre_steps, total_steps=_total_steps,
+            )
+            _all_stim_arrays[_tl] = _arr
 
     # target별로 실행 (stim 배열은 재사용, _run_single_target에 직접 전달)
     for target_label, target_node_index in _target_items:
@@ -99,6 +116,7 @@ def run_dbs_stimulation(
             data=data,
             stimulus_modes=stimulus_modes,
             prebuilt_stim_array=_all_stim_arrays[target_label],
+            modelb=_modelb_by_target[target_label],
         )
 
     print(f"\n[DBS] All outputs saved to: {os.path.abspath(cfg.dbs_output_base_dir)}")
@@ -145,6 +163,7 @@ def _run_single_target(
     data,
     stimulus_modes,
     prebuilt_stim_array=None,  # Patch 4: 미리 빌드된 stim 배열 (None이면 내부에서 생성)
+    modelb=None,  # Model B: dict(w, rate_e, rate_i) — 시뮬은 rank-1 그대로 전달
 ) -> None:
     print(f"\n{'='*60}\nTarget: {target_label} (node {target_node_index})\n{'='*60}")
 
@@ -158,21 +177,21 @@ def _run_single_target(
     onset_step = pre_steps
 
     # Patch 4: 미리 빌드된 stim 배열이 있으면 재사용, 없으면 기존 방식으로 생성
-    if prebuilt_stim_array is not None:
+    if modelb is not None:
+        # model_b: 플롯/CSV 용 rate 배열(rank-1 outer, CPU) — 시뮬은 rank-1 그대로 전달
+        stimulation_array = np.outer(modelb["rate_e"], modelb["w"]).astype(np.float32)
+        actual_pulse_count = derived["n_pulses"]
+        stimulation_jax = None
+    elif prebuilt_stim_array is not None:
         stimulation_array = prebuilt_stim_array
         actual_pulse_count = derived["n_pulses"]
+        stimulation_jax = jnp.asarray(stimulation_array, dtype=jnp.float32)
     else:
-        stimulation_array, actual_pulse_count = _build_biphasic_pulse_train(
-            target_node_index=target_node_index,
-            n_nodes=n_nodes,
-            onset_step=onset_step,
-            amplitude=cfg.dbs_pulse_amplitude,
-            phase_duration_steps=derived["phase_duration_steps"],
-            n_pulses=derived["n_pulses"],
-            total_steps=total_steps,
-            gap_steps=derived["gap_steps"],
+        stimulation_array, actual_pulse_count = _build_stim_array(
+            cfg=cfg, derived=derived, target_node_index=target_node_index,
+            n_nodes=n_nodes, onset_step=onset_step, total_steps=total_steps,
         )
-    stimulation_jax = jnp.asarray(stimulation_array, dtype=jnp.float32)
+        stimulation_jax = jnp.asarray(stimulation_array, dtype=jnp.float32)
 
     print(
         f"[INFO] actual_pulses={actual_pulse_count}  "
@@ -189,6 +208,7 @@ def _run_single_target(
             stimulation_jax=stimulation_jax,
             cfg=cfg,
             stimulus_mode=stimulus_mode,
+            modelb=modelb,
         )
         network.dynamics.dynamics = types.MethodType(stimulated_fn, network.dynamics)
 
@@ -252,7 +272,16 @@ def _run_single_target(
 
 # ── 자극 dynamics 생성 ───────────────────────────────────────
 
-def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_mode: str):
+def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_mode: str, modelb=None):
+    mb = None
+    if stimulus_mode == "model_b":
+        assert modelb is not None, "model_b 모드는 modelb=dict(w, rate_e, rate_i) 필요"
+        mb = {k: jnp.asarray(v) for k, v in modelb.items()}
+        assert mb["rate_e"].shape == mb["rate_i"].shape, "rate_e/rate_i 길이 불일치"
+        n_time = mb["rate_e"].shape[0]
+    else:
+        n_time = stimulation_jax.shape[0]
+
     def stimulated_dynamics(self, time_ms, state, params, coupling, external):
         dtype = state.dtype
         excitatory_activity = state[0]
@@ -262,9 +291,10 @@ def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_
 
         time_step_index = jnp.clip(
             jnp.round(time_ms / cfg.integration_dt_ms).astype(jnp.int32),
-            0, stimulation_jax.shape[0] - 1,
+            0, n_time - 1,
         )
-        stimulus_vector = jnp.asarray(stimulation_jax[time_step_index], dtype=dtype)
+        if stimulus_mode != "model_b":
+            stimulus_vector = jnp.asarray(stimulation_jax[time_step_index], dtype=dtype)
 
         # Reduced Wong-Wang params (model.py ReducedWongWangEIB 와 동일)
         J_N = jnp.asarray(params.J_N, dtype=dtype)
@@ -290,15 +320,25 @@ def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_
 
         # 자극 분배: inside_stim → x_e_pre 직접 주입(I_ext 자리),
         #            outside_stim → dS_e_dt 에 가산(TVB default 방식)
-        if stimulus_mode == "true_p_t":
+        if stimulus_mode == "model_b":
+            # §19: rate(Hz) 를 gating 항 안에 가산 — 전류 주입 없음
+            inside_stim = jnp.zeros_like(excitatory_activity)
+            outside_stim = jnp.zeros_like(excitatory_activity)
+            w_vec = jnp.asarray(mb["w"], dtype=dtype)
+            dbs_rate_e = w_vec * mb["rate_e"][time_step_index].astype(dtype)
+            dbs_rate_i = w_vec * mb["rate_i"][time_step_index].astype(dtype)
+        elif stimulus_mode == "true_p_t":
             inside_stim = stimulus_vector
             outside_stim = jnp.zeros_like(stimulus_vector)
+            dbs_rate_e = dbs_rate_i = jnp.asarray(0.0, dtype=dtype)
         elif stimulus_mode == "tvb_default":
             inside_stim = jnp.zeros_like(stimulus_vector)
             outside_stim = stimulus_vector
+            dbs_rate_e = dbs_rate_i = jnp.asarray(0.0, dtype=dtype)
         elif stimulus_mode == "hybrid":
             inside_stim = half * stimulus_vector
             outside_stim = half * stimulus_vector
+            dbs_rate_e = dbs_rate_i = jnp.asarray(0.0, dtype=dtype)
         else:
             raise ValueError(f"Unsupported stimulus_mode: {stimulus_mode}")
 
@@ -319,14 +359,14 @@ def _make_stimulated_dynamics(original_dynamics, stimulation_jax, cfg, stimulus_
         )
         x_e = a_e * x_e_pre - b_e
         H_e = _rww_H(x_e, d_e)
-        excitatory_derivative = -(S_e / tau_e) + (one - S_e) * H_e * gamma_e
+        excitatory_derivative = -(S_e / tau_e) + (one - S_e) * (H_e + dbs_rate_e) * gamma_e
         excitatory_derivative = excitatory_derivative + outside_stim
 
         # Inhibitory input
         x_i_pre = J_N_S_e - S_i + W_i * I_o + lamda * c_ffi
         x_i = a_i * x_i_pre - b_i
         H_i = _rww_H(x_i, d_i)
-        inhibitory_derivative = -(S_i / tau_i) + H_i * gamma_i
+        inhibitory_derivative = -(S_i / tau_i) + (H_i + dbs_rate_i) * gamma_i
 
         return (
             jnp.stack([excitatory_derivative, inhibitory_derivative], axis=0),
@@ -781,7 +821,34 @@ def _print_stimulation_summary(cfg: Config, derived: dict) -> None:
     )
     print(f"  pre_dur        = {cfg.dbs_pre_stimulation_duration_ms / 1000:.0f}s")
     print(f"  stim_dur       = {cfg.dbs_stimulation_duration_ms / 1000:.0f}s")
+    if getattr(cfg, "dbs_std_enable", False):
+        print(f"  STD            = ON (U={cfg.dbs_std_U}, tau_rec={cfg.dbs_std_tau_rec_ms}ms, "
+              f"tau_fac={cfg.dbs_std_tau_fac_ms}ms, tau_syn={cfg.dbs_std_tau_syn_ms}ms) "
+              f"— biphasic 대신 단극성 시냅스 전류")
     print("=" * 60)
+
+
+def _build_stim_array(cfg: Config, derived: dict, target_node_index: int,
+                      n_nodes: int, onset_step: int, total_steps: int) -> tuple:
+    """자극 배열 생성 분기: STD 시냅스 전달(dbs_std_enable) vs 원 biphasic 파형."""
+    if getattr(cfg, "dbs_std_enable", False):
+        arr = build_std_drive(
+            target_node_index=target_node_index, n_nodes=n_nodes,
+            onset_step=onset_step, total_steps=total_steps,
+            period_steps=derived["period_steps"], n_pulses=derived["n_pulses"],
+            cfg=cfg,
+        )
+        return arr, derived["n_pulses"]
+    return _build_biphasic_pulse_train(
+        target_node_index=target_node_index,
+        n_nodes=n_nodes,
+        onset_step=onset_step,
+        amplitude=cfg.dbs_pulse_amplitude,
+        phase_duration_steps=derived["phase_duration_steps"],
+        n_pulses=derived["n_pulses"],
+        total_steps=total_steps,
+        gap_steps=derived["gap_steps"],
+    )
 
 
 def _build_biphasic_pulse_train(

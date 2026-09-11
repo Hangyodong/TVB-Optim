@@ -36,6 +36,9 @@ def main():
     cfg.fic_posthoc_top_k = 10
     base_cv = cfg.cache_version
 
+    # ⚠ cache_version 은 load_data 전에 확정해야 한다 — data["cache_tag"] 가 여기서 굳고
+    #   run_fic 이 그 tag 로 저장하므로, 나중에 바꾸면 본선 캐시 디렉터리를 오염시킨다.
+    cfg.cache_version = f"{base_cv}_pfic"
     data = load_data(cfg)
     np.fill_diagonal(data["fc_target"], 0.0)
     FC_emp = np.nan_to_num(np.asarray(data["fc_target"], np.float32))
@@ -51,7 +54,6 @@ def main():
     ]
     rows = []
     for label, tag, wl, wf in conds:
-        cfg.cache_version = f"{base_cv}_pfic{tag}"
         ps = ParamSet(c_ei=np.ones(n, np.float32),
                       wLRE=np.asarray(wl, np.float32),
                       wFFI=np.asarray(wf, np.float32),
